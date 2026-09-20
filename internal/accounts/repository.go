@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"multi-codex-proxy/internal/apperr"
 	"multi-codex-proxy/internal/codex"
 )
 
@@ -139,12 +140,16 @@ func (r *Repository) Acquire() (codex.Account, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.state.Accounts) == 0 {
-		return codex.Account{}, fmt.Errorf("no Codex account signed in (press a in TUI)")
+		return codex.Account{}, apperr.New("acquire", apperr.CodeAccounts,
+			fmt.Errorf("no Codex account signed in"),
+			"press a in the TUI to add your first ChatGPT account")
 	}
 	for range len(r.state.Accounts) {
 		idx := codex.SelectIndex(r.state.Accounts, r.state.NextAccountIndex, codex.NowMillis())
 		if idx == nil {
-			return codex.Account{}, fmt.Errorf("no available Codex account (all disabled, invalid, or at 100%%)")
+			return codex.Account{}, apperr.New("acquire", apperr.CodeAccounts,
+				fmt.Errorf("all %d accounts busy: disabled, invalid, or at 100%% quota", len(r.state.Accounts)),
+				"press r to refresh usage, e to enable an account, or wait for reset time")
 		}
 		candidate := r.state.Accounts[*idx]
 		if !candidate.IsAvailable(codex.NowMillis()) {
@@ -160,7 +165,9 @@ func (r *Repository) Acquire() (codex.Account, error) {
 		_ = r.store.Write(r.state)
 		return fresh, nil
 	}
-	return codex.Account{}, fmt.Errorf("no available Codex account")
+	return codex.Account{}, apperr.New("acquire", apperr.CodeUpstream,
+		fmt.Errorf("every account failed token refresh"),
+		"check network, then press R to refresh all")
 }
 
 func (r *Repository) UpdateUsage(id string, usage *codex.UsageSnapshot) {
@@ -274,7 +281,8 @@ func (r *Repository) ensureFreshLocked(a codex.Account) (codex.Account, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return codex.Account{}, fmt.Errorf("refresh %s: %w", a.Email, err)
+		return codex.Account{}, apperr.New("refresh "+a.Email, apperr.CodeUpstream, err,
+			"check network and retry; account kept for next round")
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -284,8 +292,13 @@ func (r *Repository) ensureFreshLocked(a codex.Account) (codex.Account, error) {
 				x.TokenStatus = codex.StatusInvalid
 			})
 			_ = r.store.Write(r.state)
+			return codex.Account{}, apperr.New("refresh "+a.Email, apperr.CodeAuth,
+				fmt.Errorf("HTTP %d: login expired", resp.StatusCode),
+				"press a to sign this account in again")
 		}
-		return codex.Account{}, fmt.Errorf("token refresh failed for %s: HTTP %d", a.Email, resp.StatusCode)
+		return codex.Account{}, apperr.New("refresh "+a.Email, apperr.CodeUpstream,
+			fmt.Errorf("HTTP %d", resp.StatusCode),
+			"transient error, will try next account automatically")
 	}
 	var token map[string]any
 	if err := json.Unmarshal(body, &token); err != nil {
@@ -323,7 +336,8 @@ func (r *Repository) fetchUsageLocked(a codex.Account) (codex.Account, error) {
 	req.Header.Set("Accept", "application/json")
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return a, fmt.Errorf("usage %s: %w", a.Email, err)
+		return a, apperr.New("usage "+a.Email, apperr.CodeUpstream, err,
+			"quota check failed, old quota kept; retry with r")
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -332,10 +346,14 @@ func (r *Repository) fetchUsageLocked(a codex.Account) (codex.Account, error) {
 			x.TokenStatus = codex.StatusInvalid
 		})
 		_ = r.store.Write(r.state)
-		return a, fmt.Errorf("usage %s: HTTP 401, marked INVALID", a.Email)
+		return a, apperr.New("usage "+a.Email, apperr.CodeAuth,
+			fmt.Errorf("HTTP 401: login expired"),
+			"press a to sign this account in again")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return a, fmt.Errorf("usage %s: HTTP %d", a.Email, resp.StatusCode)
+		return a, apperr.New("usage "+a.Email, apperr.CodeUpstream,
+			fmt.Errorf("HTTP %d", resp.StatusCode),
+			"quota endpoint hiccup, old quota kept; retry with r")
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {

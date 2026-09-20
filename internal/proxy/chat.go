@@ -14,28 +14,28 @@ import (
 // through only when the model already accepts them upstream.
 func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		writeErr(w, 405, "method must be POST")
+		writeErr(w, 405, "method must be POST", "POST a JSON body with model and messages")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeErr(w, 400, "read body: "+err.Error())
+		writeErr(w, 400, "read body: "+err.Error(), "keep requests under 10 MiB")
 		return
 	}
 	var in map[string]any
 	if err := json.Unmarshal(raw, &in); err != nil || in == nil {
-		writeErr(w, 400, "body must be JSON object")
+		writeErr(w, 400, "body must be a JSON object", "example: {\"model\":\"gpt-5-codex\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
 		return
 	}
 	model, _ := in["model"].(string)
 	if model == "" {
-		writeErr(w, 400, "body.model is required")
+		writeErr(w, 400, "body.model is required", "list valid ids via GET /v1/models")
 		return
 	}
 	msgs, _ := in["messages"].([]any)
 	if len(msgs) == 0 {
-		writeErr(w, 400, "body.messages must not be empty")
+		writeErr(w, 400, "body.messages must not be empty", "add at least one user message")
 		return
 	}
 	stream, _ := in["stream"].(bool)
@@ -85,7 +85,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	var up map[string]any
 	if err := json.Unmarshal(rec.buf, &up); err != nil {
-		writeErr(w, 502, "upstream: bad JSON")
+		writeErr(w, 502, "upstream: bad JSON", "retry; if it repeats, upstream changed shape")
 		return
 	}
 	text := responsesText(up)

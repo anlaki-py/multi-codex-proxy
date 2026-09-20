@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"multi-codex-proxy/internal/accounts"
+	"multi-codex-proxy/internal/apperr"
 	"multi-codex-proxy/internal/codex"
 )
 
@@ -59,12 +60,12 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 // keep only visibility == list, return OpenAI list shape.
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
-		writeErr(w, 405, "method must be GET")
+		writeErr(w, 405, "method must be GET", "use GET /v1/models with no body")
 		return
 	}
 	acct, err := s.repo.Acquire()
 	if err != nil {
-		writeErr(w, 503, err.Error())
+		writeAppErr(w, 503, err)
 		return
 	}
 	req, _ := http.NewRequestWithContext(r.Context(), "GET",
@@ -72,23 +73,23 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	s.setUpstreamHeaders(req, acct)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		writeErr(w, 502, "upstream models: "+err.Error())
+		writeErr(w, 502, "upstream models unreachable: "+err.Error(), "check network, retry in a minute")
 		return
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode == 401 {
 		s.repo.MarkInvalid(acct.ID)
-		writeErr(w, 502, "upstream models: HTTP 401, account marked invalid")
+		writeErr(w, 502, "upstream models: HTTP 401, account marked invalid", "press a in TUI to sign this account in again")
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writeErr(w, 502, fmt.Sprintf("upstream models: HTTP %d", resp.StatusCode))
+		writeErr(w, 502, fmt.Sprintf("upstream models: HTTP %d", resp.StatusCode), "transient upstream error, retry shortly")
 		return
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		writeErr(w, 502, "upstream models: bad JSON")
+		writeErr(w, 502, "upstream models: bad JSON", "retry; if it repeats, upstream changed shape")
 		return
 	}
 	items, _ := parsed["models"].([]any)
@@ -117,22 +118,27 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 // and streams SSE back verbatim when stream is true.
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		writeErr(w, 405, "method must be POST")
+		writeErr(w, 405, "method must be POST", "POST a JSON body with model and input")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeErr(w, 400, "read body: "+err.Error())
+		writeErr(w, 400, "read body: "+err.Error(), "keep requests under 10 MiB")
 		return
 	}
 	var body map[string]any
 	if err := json.Unmarshal(raw, &body); err != nil || body == nil {
-		writeErr(w, 400, "body must be JSON object")
+		writeErr(w, 400, "body must be a JSON object", "example: {\"model\":\"gpt-5-codex\",\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
 		return
 	}
-	if _, ok := body["model"].(string); !ok {
-		writeErr(w, 400, "body.model is required")
+	model, _ := body["model"].(string)
+	if model == "" {
+		writeErr(w, 400, "body.model is required", "list valid ids via GET /v1/models")
+		return
+	}
+	if len(raw) == 0 {
+		writeErr(w, 400, "empty body", "send a JSON object with model and input")
 		return
 	}
 	stream, _ := body["stream"].(bool)
@@ -140,7 +146,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 
 	acct, err := s.repo.Acquire()
 	if err != nil {
-		writeErr(w, 503, err.Error())
+		writeAppErr(w, 503, err)
 		return
 	}
 	upBody, _ := json.Marshal(body)
@@ -153,7 +159,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		writeErr(w, 502, "upstream: "+err.Error())
+		writeErr(w, 502, "upstream unreachable: "+err.Error(), "check network; request was not charged, safe to retry")
 		return
 	}
 	defer resp.Body.Close()
@@ -227,6 +233,19 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]any{"error": map[string]any{"message": msg, "code": code}})
+func writeErr(w http.ResponseWriter, code int, msg, hint string) {
+	errObj := map[string]any{"message": msg, "code": code}
+	if hint != "" {
+		errObj["hint"] = hint
+	}
+	writeJSON(w, code, map[string]any{"error": errObj})
+}
+
+// writeAppErr unwraps apperr.Error so API clients see message plus hint.
+func writeAppErr(w http.ResponseWriter, code int, err error) {
+	msg, hint := apperr.UserMessage(err)
+	if msg == "" {
+		msg = "unknown error"
+	}
+	writeErr(w, code, msg, hint)
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"multi-codex-proxy/internal/accounts"
+	"multi-codex-proxy/internal/apperr"
 	"multi-codex-proxy/internal/codex"
 )
 
@@ -32,7 +33,8 @@ func StartLogin(ctx context.Context, repo *accounts.Repository, client *http.Cli
 	errCh := make(chan error, 1)
 	srv, port, err := serveCallback(ctx, state, codeCh, errCh)
 	if err != nil {
-		return codex.Account{}, err
+		return codex.Account{}, apperr.New("login", apperr.CodeAuth, err,
+			"close anything on ports 1455/1457, then press a again")
 	}
 	defer srv.Close()
 	redirect := fmt.Sprintf("http://localhost:%d/auth/callback", port)
@@ -57,20 +59,25 @@ func StartLogin(ctx context.Context, repo *accounts.Repository, client *http.Cli
 	select {
 	case code = <-codeCh:
 	case err := <-errCh:
-		return codex.Account{}, err
+		return codex.Account{}, apperr.New("login callback", apperr.CodeAuth, err,
+			"retry sign in, approve in browser, keep this terminal open")
 	case <-ctx.Done():
-		return codex.Account{}, fmt.Errorf("login cancelled")
+		return codex.Account{}, apperr.New("login", apperr.CodeAuth, fmt.Errorf("cancelled"),
+			"press a to start over")
 	case <-time.After(5 * time.Minute):
-		return codex.Account{}, fmt.Errorf("login timed out after 5 minutes")
+		return codex.Account{}, apperr.New("login", apperr.CodeAuth, fmt.Errorf("timed out after 5 minutes"),
+			"press a to start over, approve faster in browser")
 	}
 
 	tokenJSON, err := exchangeCode(ctx, client, code, redirect, verifier)
 	if err != nil {
-		return codex.Account{}, err
+		return codex.Account{}, apperr.New("login exchange", apperr.CodeUpstream, err,
+			"check network, then press a to retry")
 	}
 	acct, err := repo.SaveLogin(tokenJSON)
 	if err != nil {
-		return codex.Account{}, err
+		return codex.Account{}, apperr.New("login save", apperr.CodeAccounts, err,
+			"config dir may be unwritable; check ~/.config perms")
 	}
 	// Pull usage right away like the app does after OAuth success.
 	_, _ = repo.RefreshAccount(acct.ID)

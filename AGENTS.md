@@ -14,13 +14,15 @@ Purpose: Go proxy that pools Codex OAuth accounts and serves OpenAI routes.
 
 ## Setup
 
-`go run .` for TUI. `go run . --serve` for headless.
+`make run` for TUI. `make serve` for headless. All targets force
+`CGO_ENABLED=0` for static binaries. Never call `go run` or `go build`
+directly, use make.
 
 ## Test
 
-`go build ./...`
-`go vet ./...`
-`go test ./...`
+`make build`
+`make vet`
+`make test``
 
 ## Limits
 

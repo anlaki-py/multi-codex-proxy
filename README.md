@@ -8,14 +8,26 @@ Sign in N ChatGPT accounts once, rotate them round robin, track quota from upstr
 
 ## Quick start
 
-1. Run `go run .` in `multi-codex-proxy`.
+1. Run `make run` in `multi-codex-proxy`. Static build, `CGO_ENABLED=0` always.
 2. Press `a` to sign in. Browser opens to OpenAI, callback lands on `127.0.0.1:1455`.
-3. Press `s` to serve on `127.0.0.1:18789`.
+3. Press `s` to serve on `127.0.0.1:18789`. Port busy shows a clear error with a `--port` hint.
 4. Point a client at it:
    `curl http://127.0.0.1:18789/v1/models`
    `curl -X POST http://127.0.0.1:18789/v1/responses -H 'Content-Type: application/json' -d '{"model":"gpt-5-codex","input":[{"role":"user","content":"hi"}]}'`
 
-Headless: `go run . --serve --port 18789`.
+Headless: `make serve` or `go run . --serve --port 18789`.
+
+## Errors
+
+Every failure shows what broke plus a hint. Port busy suggests `--port`.
+Expired logins say which account to reauth with `a`. Upstream hiccups say
+whether a retry is safe. API errors return `error.message` plus `error.hint`.
+
+## TUI layout
+
+Adapts to terminal size. Narrow portrait stacks one account per two lines
+with short keys. Wide landscape splits list left and quota detail right.
+Resize sends `WindowSizeMsg` and the view reflows at once.
 
 ## Endpoints
 
