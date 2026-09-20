@@ -34,7 +34,8 @@ Resize sends `WindowSizeMsg` and the view reflows at once.
 - `GET /health`
 - `GET /v1/models` — upstream Codex list filtered to `visibility == list`
 - `POST /v1/responses` — full passthrough, SSE when `stream:true`
-- `POST /v1/chat/completions` — small shim for text chats, streams fall back to `/v1/responses`
+- `POST /v1/chat/completions` — full translation: text, images, function tools
+  with `call_id` preserved, `tool_choice`, usage, plus SSE chunk streaming
 
 Upstream is `https://chatgpt.com/backend-api/codex` with `originator: codex_cli_rs`, `OpenAI-Beta: responses=experimental`, UA `codex_cli_rs/0.144.5`.
 

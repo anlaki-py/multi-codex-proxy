@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -144,22 +146,9 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	stream, _ := body["stream"].(bool)
 	ensureInstructions(body)
 
-	acct, err := s.repo.Acquire()
+	resp, acct, err := s.postUpstream(r.Context(), body, stream)
 	if err != nil {
-		writeAppErr(w, 503, err)
-		return
-	}
-	upBody, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(r.Context(), "POST", codex.CodexAPI+"/responses", bytes.NewReader(upBody))
-	s.setUpstreamHeaders(req, acct)
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-	s.log("responses model=%v account=%s stream=%v", body["model"], acct.Email, stream)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		writeErr(w, 502, "upstream unreachable: "+err.Error(), "check network; request was not charged, safe to retry")
+		writeAppErr(w, statusForErr(err), err)
 		return
 	}
 	defer resp.Body.Close()
@@ -195,6 +184,49 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
+
+// postUpstream acquires a healthy account and POSTs a Responses body.
+// Caller closes resp.Body and feeds resp to afterUpstream.
+func (s *Server) postUpstream(ctx context.Context, body map[string]any, stream bool) (*http.Response, codex.Account, error) {
+	acct, err := s.repo.Acquire()
+	if err != nil {
+		return nil, codex.Account{}, err
+	}
+	upBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, codex.Account{}, apperr.New("upstream encode", apperr.CodeInput, err,
+			"request could not be serialized")
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", codex.CodexAPI+"/responses", bytes.NewReader(upBody))
+	if err != nil {
+		return nil, codex.Account{}, apperr.New("upstream request", apperr.CodeUpstream, err,
+			"retry the request")
+	}
+	s.setUpstreamHeaders(req, acct)
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	s.log("responses model=%v account=%s stream=%v", body["model"], acct.Email, stream)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, codex.Account{}, apperr.New("upstream call", apperr.CodeUpstream, err,
+			"check network; request was not charged, safe to retry")
+	}
+	return resp, acct, nil
+}
+
+func statusForErr(err error) int {
+	var ae *apperr.Error
+	if errors.As(err, &ae) {
+		switch ae.Code {
+		case apperr.CodeAccounts, apperr.CodeAuth:
+			return 503
+		case apperr.CodeInput:
+			return 400
+		}
+	}
+	return 502
 }
 
 func (s *Server) setUpstreamHeaders(req *http.Request, acct codex.Account) {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,10 +9,8 @@ import (
 	"strings"
 )
 
-// chatCompletions is a small compat shim, not a full port.
-// It maps OpenAI chat messages to a Responses call, then folds
-// the text output back into chat format. Tools and images pass
-// through only when the model already accepts them upstream.
+// chatCompletions speaks Chat Completions to clients, Responses upstream.
+// Non-stream converts the full object. Stream translates SSE event by event.
 func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeErr(w, 405, "method must be POST", "POST a JSON body with model and messages")
@@ -33,46 +32,24 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "body.model is required", "list valid ids via GET /v1/models")
 		return
 	}
-	msgs, _ := in["messages"].([]any)
-	if len(msgs) == 0 {
-		writeErr(w, 400, "body.messages must not be empty", "add at least one user message")
+	stream, _ := in["stream"].(bool)
+	respBody, err := chatToResponses(in)
+	if err != nil {
+		writeAppErr(w, statusForErr(err), err)
 		return
 	}
-	stream, _ := in["stream"].(bool)
+	if !stream {
+		s.chatNonStream(w, r, model, respBody)
+		return
+	}
+	s.chatStream(w, r, model, respBody)
+}
 
-	respBody := map[string]any{
-		"model":        model,
-		"stream":       stream,
-		"store":        false,
-		"input":        toResponsesInput(msgs),
-		"instructions": systemText(msgs),
-	}
-	if v, ok := in["max_tokens"].(float64); ok && v > 0 {
-		respBody["max_output_tokens"] = int(v)
-	}
-	if v, ok := in["max_completion_tokens"].(float64); ok && v > 0 {
-		respBody["max_output_tokens"] = int(v)
-	}
-	if v, ok := in["temperature"].(float64); ok {
-		respBody["temperature"] = v
-	}
-	if v, ok := in["top_p"].(float64); ok {
-		respBody["top_p"] = v
-	}
-
-	// Reuse the responses path by issuing an internal request.
+// chatNonStream reuses the responses handler, then folds output to chat shape.
+func (s *Server) chatNonStream(w http.ResponseWriter, r *http.Request, model string, respBody map[string]any) {
 	fwd, _ := json.Marshal(respBody)
 	req, _ := http.NewRequestWithContext(r.Context(), "POST", "/v1/responses", strings.NewReader(string(fwd)))
 	req.Header.Set("Content-Type", "application/json")
-	// Call handler directly so rotation, headers, usage stay in one place.
-	if stream {
-		// For streams, clients expect chat SSE. We proxy responses SSE
-		// but relabel is out of scope for v1, so return the native stream
-		// with a clear marker instead of corrupt data.
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "data: {\"error\": \"chat stream uses /v1/responses stream for now\"}\n\n")
-		return
-	}
 	rec := &captureWriter{header: http.Header{}}
 	s.responses(rec, req)
 	if rec.code == 0 {
@@ -88,106 +65,90 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, "upstream: bad JSON", "retry; if it repeats, upstream changed shape")
 		return
 	}
-	text := responsesText(up)
-	usage := map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-	if u, _ := up["usage"].(map[string]any); u != nil {
-		usage["prompt_tokens"] = u["input_tokens"]
-		usage["completion_tokens"] = u["output_tokens"]
-		usage["total_tokens"] = u["total_tokens"]
-	}
-	writeJSON(w, 200, map[string]any{
-		"id":      up["id"],
-		"object":  "chat.completion",
-		"created": 0,
-		"model":   model,
-		"choices": []any{map[string]any{
-			"index": 0,
-			"message": map[string]any{
-				"role": "assistant", "content": text,
-			},
-			"finish_reason": "stop",
-		}},
-		"usage": usage,
-	})
+	writeJSON(w, 200, responsesToChat(up, model))
 }
 
-func toResponsesInput(msgs []any) []any {
-	out := []any{}
-	for _, m := range msgs {
-		obj, _ := m.(map[string]any)
-		if obj == nil {
-			continue
-		}
-		role, _ := obj["role"].(string)
-		if role == "system" {
-			continue
-		}
-		content := plainText(obj["content"])
-		out = append(out, map[string]any{"role": role, "content": content})
+// chatStream POSTs upstream with stream true and translates each SSE event
+// into chat.completion.chunk frames. Closes with data: [DONE].
+func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, model string, respBody map[string]any) {
+	resp, acct, err := s.postUpstream(r.Context(), respBody, true)
+	if err != nil {
+		writeAppErr(w, statusForErr(err), err)
+		return
 	}
-	return out
-}
-
-func systemText(msgs []any) string {
-	parts := []string{}
-	for _, m := range msgs {
-		obj, _ := m.(map[string]any)
-		if obj == nil || obj["role"] != "system" {
-			continue
-		}
-		if t := plainText(obj["content"]); t != "" {
-			parts = append(parts, t)
+	defer resp.Body.Close()
+	s.afterUpstream(acct.ID, resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		upErr, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(upErr)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+	tr := newChatStreamTranslator(model)
+	closed := false
+	emit := func(payload string) {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
-	if len(parts) == 0 {
-		return "You are a helpful assistant."
-	}
-	return strings.Join(parts, "\n")
-}
-
-func plainText(v any) string {
-	switch t := v.(type) {
-	case string:
-		return t
-	case []any:
-		parts := []string{}
-		for _, p := range t {
-			pm, _ := p.(map[string]any)
-			if pm == nil {
-				continue
-			}
-			if s, _ := pm["text"].(string); s != "" {
-				parts = append(parts, s)
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		return ""
-	}
-}
-
-func responsesText(up map[string]any) string {
-	items, _ := up["output"].([]any)
-	parts := []string{}
-	for _, it := range items {
-		m, _ := it.(map[string]any)
-		if m == nil || m["type"] != "message" {
-			continue
-		}
-		content, _ := m["content"].([]any)
-		for _, c := range content {
-			cm, _ := c.(map[string]any)
-			if cm == nil {
-				continue
-			}
-			if cm["type"] == "output_text" {
-				if t, _ := cm["text"].(string); t != "" {
-					parts = append(parts, t)
-				}
+	finish := func() {
+		if !closed {
+			closed = true
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			if flusher != nil {
+				flusher.Flush()
 			}
 		}
 	}
-	return strings.Join(parts, "")
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	var data strings.Builder
+	flushFrame := func() {
+		raw := strings.TrimSpace(data.String())
+		data.Reset()
+		if raw == "" {
+			return
+		}
+		if raw == "[DONE]" {
+			finish()
+			return
+		}
+		lines, done := tr.translate(raw)
+		for _, l := range lines {
+			emit(l)
+		}
+		if done {
+			finish()
+		}
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			flushFrame()
+			if closed {
+				return
+			}
+			continue
+		}
+		if payload, ok := strings.CutPrefix(line, "data:"); ok {
+			if data.Len() > 0 {
+				data.WriteString("\n")
+			}
+			data.WriteString(strings.TrimSpace(payload))
+		}
+	}
+	flushFrame()
+	if !tr.finished && !closed {
+		raw, _ := json.Marshal(map[string]any{"error": "upstream stream cut off"})
+		emit(string(raw))
+	}
+	finish()
 }
 
 type captureWriter struct {
