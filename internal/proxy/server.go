@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"runtime"
 	"time"
 
@@ -20,10 +21,11 @@ import (
 // Server serves an OpenAI compatible surface backed by rotating Codex accounts.
 // Routes: GET /health, GET /v1/models, POST /v1/responses, POST /v1/chat/completions.
 type Server struct {
-	repo   *accounts.Repository
-	client *http.Client
-	ua     string
-	log    func(format string, args ...any)
+	repo    *accounts.Repository
+	client  *http.Client
+	ua      string
+	baseURL string
+	log     func(format string, args ...any)
 }
 
 func NewClient() *http.Client {
@@ -42,7 +44,7 @@ func NewServer(repo *accounts.Repository, client *http.Client, log func(string, 
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	return &Server{repo: repo, client: client, ua: codex.UserAgent(runtime.GOOS, runtime.GOARCH), log: log}
+	return &Server{repo: repo, client: client, ua: codex.UserAgent(runtime.GOOS, runtime.GOARCH), baseURL: codex.CodexAPI, log: log}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -71,7 +73,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req, _ := http.NewRequestWithContext(r.Context(), "GET",
-		codex.CodexAPI+"/models?client_version="+codex.ClientVersion, nil)
+		s.baseURL+"/models?client_version="+codex.ClientVersion, nil)
 	s.setUpstreamHeaders(req, acct)
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -187,20 +189,46 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 }
 
 // postUpstream acquires a healthy account and POSTs a Responses body.
-// Caller closes resp.Body and feeds resp to afterUpstream.
+// Params the upstream rejects as unsupported are dropped with one retry
+// each instead of failing the client request. Caller closes resp.Body
+// and feeds resp to afterUpstream.
 func (s *Server) postUpstream(ctx context.Context, body map[string]any, stream bool) (*http.Response, codex.Account, error) {
 	acct, err := s.repo.Acquire()
 	if err != nil {
 		return nil, codex.Account{}, err
 	}
+	for attempt := 0; attempt < 4; attempt++ {
+		resp, err := s.postOnce(ctx, body, stream, acct)
+		if err != nil {
+			return nil, codex.Account{}, err
+		}
+		if resp.StatusCode != 400 {
+			return resp, acct, nil
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		param, ok := findUnsupportedParam(raw)
+		if !ok {
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			return resp, acct, nil
+		}
+		delete(body, param)
+		s.log("upstream rejects param %s, dropping and retrying", param)
+	}
+	return nil, codex.Account{}, apperr.New("upstream call", apperr.CodeUpstream,
+		fmt.Errorf("upstream keeps rejecting params after 3 drops"),
+		"narrow the request fields to model, input, instructions")
+}
+
+func (s *Server) postOnce(ctx context.Context, body map[string]any, stream bool, acct codex.Account) (*http.Response, error) {
 	upBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, codex.Account{}, apperr.New("upstream encode", apperr.CodeInput, err,
+		return nil, apperr.New("upstream encode", apperr.CodeInput, err,
 			"request could not be serialized")
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", codex.CodexAPI+"/responses", bytes.NewReader(upBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", s.baseURL+"/responses", bytes.NewReader(upBody))
 	if err != nil {
-		return nil, codex.Account{}, apperr.New("upstream request", apperr.CodeUpstream, err,
+		return nil, apperr.New("upstream request", apperr.CodeUpstream, err,
 			"retry the request")
 	}
 	s.setUpstreamHeaders(req, acct)
@@ -210,10 +238,22 @@ func (s *Server) postUpstream(ctx context.Context, body map[string]any, stream b
 	s.log("responses model=%v account=%s stream=%v", body["model"], acct.Email, stream)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, codex.Account{}, apperr.New("upstream call", apperr.CodeUpstream, err,
+		return nil, apperr.New("upstream call", apperr.CodeUpstream, err,
 			"check network; request was not charged, safe to retry")
 	}
-	return resp, acct, nil
+	return resp, nil
+}
+
+// unsupportedParamRe matches "Unsupported parameter: <name>" in upstream
+// 400 bodies, whether under detail or error.message.
+var unsupportedParamRe = regexp.MustCompile(`Unsupported parameter:\s*"?([A-Za-z0-9_.\-]+)"?`)
+
+func findUnsupportedParam(raw []byte) (string, bool) {
+	m := unsupportedParamRe.FindSubmatch(raw)
+	if len(m) != 2 || len(m[1]) == 0 {
+		return "", false
+	}
+	return string(m[1]), true
 }
 
 func statusForErr(err error) int {

@@ -21,7 +21,9 @@ Headless: `make serve` or `go run . --serve --port 18789`.
 
 Every failure shows what broke plus a hint. Port busy suggests `--port`.
 Expired logins say which account to reauth with `a`. Upstream hiccups say
-whether a retry is safe. API errors return `error.message` plus `error.hint`.
+whether a retry is safe. Params the upstream rejects as unsupported are
+dropped with an automatic retry instead of failing. API errors return
+`error.message` plus `error.hint`.
 
 ## TUI layout
 
