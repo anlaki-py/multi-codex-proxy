@@ -39,7 +39,7 @@ Resize sends `WindowSizeMsg` and the view reflows at once.
 - `POST /v1/chat/completions` — full translation: text, images, function tools
   with `call_id` preserved, `tool_choice`, usage, plus SSE chunk streaming
 
-Upstream is `https://chatgpt.com/backend-api/codex` with `originator: codex_cli_rs`, `OpenAI-Beta: responses=experimental`, UA `codex_cli_rs/0.144.5`.
+Upstream is `https://chatgpt.com/backend-api/codex` with `originator: codex_cli_rs`, `OpenAI-Beta: responses=experimental`, UA `codex_cli_rs/0.144.5`. Upstream only speaks `stream: true`, so non-stream requests are collected server side and returned as one object.
 
 ## Config
 

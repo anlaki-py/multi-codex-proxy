@@ -29,6 +29,7 @@ directly, use make.
 - No image gen upstream. Chat image parts pass through or degrade to text.
 - Chat tools map to Responses function tools, `call_id` kept as tool id.
 - Upstream 400s naming an unsupported param are retried with it dropped.
+- Upstream only speaks stream:true; non-stream is collected server side.
 - Token file is 0600 JSON, not Keystore. Do not commit it.
 - Body cap is 10 MiB per request.
 

@@ -1,12 +1,10 @@
 package proxy
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 )
 
 // chatCompletions speaks Chat Completions to clients, Responses upstream.
@@ -45,24 +43,27 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.chatStream(w, r, model, respBody)
 }
 
-// chatNonStream reuses the responses handler, then folds output to chat shape.
+// chatNonStream streams upstream (the only mode Codex serves) and folds
+// the collected result into one chat completion.
 func (s *Server) chatNonStream(w http.ResponseWriter, r *http.Request, model string, respBody map[string]any) {
-	fwd, _ := json.Marshal(respBody)
-	req, _ := http.NewRequestWithContext(r.Context(), "POST", "/v1/responses", strings.NewReader(string(fwd)))
-	req.Header.Set("Content-Type", "application/json")
-	rec := &captureWriter{header: http.Header{}}
-	s.responses(rec, req)
-	if rec.code == 0 {
-		rec.code = 200
-	}
-	if rec.code < 200 || rec.code >= 300 {
-		w.WriteHeader(rec.code)
-		_, _ = w.Write(rec.buf)
+	respBody["stream"] = true
+	resp, acct, err := s.postUpstream(r.Context(), respBody, true)
+	if err != nil {
+		writeAppErr(w, statusForErr(err), err)
 		return
 	}
-	var up map[string]any
-	if err := json.Unmarshal(rec.buf, &up); err != nil {
-		writeErr(w, 502, "upstream: bad JSON", "retry; if it repeats, upstream changed shape")
+	defer resp.Body.Close()
+	s.afterUpstream(acct.ID, resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		upErr, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(upErr)
+		return
+	}
+	up, err := collectResponses(resp.Body, model)
+	if err != nil {
+		writeAppErr(w, 502, err)
 		return
 	}
 	writeJSON(w, 200, responsesToChat(up, model))
@@ -106,18 +107,10 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, model string
 			}
 		}
 	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
-	var data strings.Builder
-	flushFrame := func() {
-		raw := strings.TrimSpace(data.String())
-		data.Reset()
-		if raw == "" {
-			return
-		}
+	forEachSSEFrame(resp.Body, func(raw string) bool {
 		if raw == "[DONE]" {
 			finish()
-			return
+			return false
 		}
 		lines, done := tr.translate(raw)
 		for _, l := range lines {
@@ -125,48 +118,13 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, model string
 		}
 		if done {
 			finish()
+			return false
 		}
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			flushFrame()
-			if closed {
-				return
-			}
-			continue
-		}
-		if payload, ok := strings.CutPrefix(line, "data:"); ok {
-			if data.Len() > 0 {
-				data.WriteString("\n")
-			}
-			data.WriteString(strings.TrimSpace(payload))
-		}
-	}
-	flushFrame()
+		return !closed
+	})
 	if !tr.finished && !closed {
 		raw, _ := json.Marshal(map[string]any{"error": "upstream stream cut off"})
 		emit(string(raw))
 	}
 	finish()
 }
-
-type captureWriter struct {
-	header http.Header
-	buf    []byte
-	code   int
-}
-
-func (c *captureWriter) Header() http.Header {
-	if c.header == nil {
-		c.header = http.Header{}
-	}
-	return c.header
-}
-
-func (c *captureWriter) Write(b []byte) (int, error) {
-	c.buf = append(c.buf, b...)
-	return len(b), nil
-}
-
-func (c *captureWriter) WriteHeader(code int) { c.code = code }

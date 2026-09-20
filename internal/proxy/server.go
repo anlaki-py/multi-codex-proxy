@@ -117,9 +117,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
 
-// responses is a straight passthrough to POST CodexAPI/responses.
-// It injects default instructions like CodexProvider.withDefaultInstructions
-// and streams SSE back verbatim when stream is true.
+// responses proxies POST CodexAPI/responses.
+// It injects default instructions like CodexProvider.withDefaultInstructions.
+// Upstream only speaks stream:true, so non-stream requests are collected
+// server side and returned as one object. Stream requests pass SSE through.
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeErr(w, 405, "method must be POST", "POST a JSON body with model and input")
@@ -147,8 +148,11 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := body["stream"].(bool)
 	ensureInstructions(body)
+	// Codex only serves stream:true. Non-stream clients get a collected
+	// object below, so always ask upstream for SSE.
+	body["stream"] = true
 
-	resp, acct, err := s.postUpstream(r.Context(), body, stream)
+	resp, acct, err := s.postUpstream(r.Context(), body, true)
 	if err != nil {
 		writeAppErr(w, statusForErr(err), err)
 		return
@@ -164,8 +168,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !stream {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.Copy(w, io.LimitReader(resp.Body, 20<<20))
+		up, err := collectResponses(resp.Body, model)
+		if err != nil {
+			writeAppErr(w, 502, err)
+			return
+		}
+		writeJSON(w, 200, up)
 		return
 	}
 	// SSE passthrough with flush, verbatim bytes.
