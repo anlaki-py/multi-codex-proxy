@@ -15,7 +15,11 @@ Sign in N ChatGPT accounts once, rotate them round robin, track quota from upstr
    `curl http://127.0.0.1:18789/v1/models`
    `curl -X POST http://127.0.0.1:18789/v1/responses -H 'Content-Type: application/json' -d '{"model":"gpt-5-codex","input":[{"role":"user","content":"hi"}]}'`
 
-Headless: `make serve` or `go run . --serve --port 18789`.
+Headless: `make serve` or `go run . --serve --port 18789 --host 127.0.0.1`.
+
+Auth: open by default, any `Authorization: Bearer <anything>` works, even none.
+Lock it with `--key <KEY>` or `"key"` in `config.json`. Locked servers
+return 401 without the exact key. `/health` stays open.
 
 ## Errors
 
@@ -45,7 +49,7 @@ Upstream is `https://chatgpt.com/backend-api/codex` with `originator: codex_cli_
 
 Lives in `$XDG_CONFIG_HOME/multi-codex-proxy` or `~/.config/multi-codex-proxy`:
 
-- `config.json` — host, port
+- `config.json` — host, port, key (empty key means open)
 - `accounts.json` — accounts plus `nextAccountIndex`, mode `0600`
 
 Tokens never print to logs. Delete `accounts.json` to sign out all.

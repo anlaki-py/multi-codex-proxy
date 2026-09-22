@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-// Config holds proxy runtime settings. Secrets never live here.
+// Config holds proxy runtime settings. Secrets never live here, except the
+// local API key that gates client access when set. Empty Key means open.
 type Config struct {
 	Host string `json:"host"`
 	Port int    `json:"port"`
+	Key  string `json:"key,omitempty"`
 }
 
 func Default() Config {
@@ -60,6 +63,7 @@ func Load() (Config, string, error) {
 	if cfg.Host == "" {
 		cfg.Host = "127.0.0.1"
 	}
+	cfg.Key = strings.TrimSpace(cfg.Key)
 	return cfg, dir, nil
 }
 

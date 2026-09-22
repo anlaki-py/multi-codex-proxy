@@ -14,6 +14,9 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 405, "method must be POST", "POST a JSON body with model and messages")
 		return
 	}
+	if !s.checkAuth(w, r) {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {

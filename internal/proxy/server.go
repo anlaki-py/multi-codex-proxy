@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"runtime"
+	"strings"
 	"time"
 
 	"multi-codex-proxy/internal/accounts"
@@ -20,11 +22,13 @@ import (
 
 // Server serves an OpenAI compatible surface backed by rotating Codex accounts.
 // Routes: GET /health, GET /v1/models, POST /v1/responses, POST /v1/chat/completions.
+// Empty APIKey means open: any key, or none, is accepted. Set APIKey to lock.
 type Server struct {
 	repo    *accounts.Repository
 	client  *http.Client
 	ua      string
 	baseURL string
+	APIKey  string
 	log     func(format string, args ...any)
 }
 
@@ -60,11 +64,28 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "upstream": codex.CodexAPI})
 }
 
+// checkAuth gates client access. Open when APIKey is empty, else the
+// request needs Authorization: Bearer <APIKey>. Health stays ungated.
+func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) bool {
+	if s.APIKey == "" {
+		return true
+	}
+	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.APIKey)) == 1 {
+		return true
+	}
+	writeErr(w, 401, "invalid API key", "pass -H 'Authorization: Bearer <key>' matching server --key")
+	return false
+}
+
 // models mirrors CodexProvider.listModels: proxy the upstream list,
 // keep only visibility == list, return OpenAI list shape.
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeErr(w, 405, "method must be GET", "use GET /v1/models with no body")
+		return
+	}
+	if !s.checkAuth(w, r) {
 		return
 	}
 	acct, err := s.repo.Acquire()
@@ -124,6 +145,9 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeErr(w, 405, "method must be POST", "POST a JSON body with model and input")
+		return
+	}
+	if !s.checkAuth(w, r) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)

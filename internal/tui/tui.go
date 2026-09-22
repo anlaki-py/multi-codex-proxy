@@ -279,7 +279,7 @@ func (m *Model) startServer() error {
 	ln, err := net.Listen("tcp", m.addr)
 	if err != nil {
 		return apperr.New("serve "+m.addr, apperr.CodeConfig, err,
-			"port is busy; restart with --port, e.g. --port 18790")
+			"port is busy or host is wrong; restart with --host/--port, e.g. --host 127.0.0.1 --port 18790")
 	}
 	m.srv = &http.Server{Handler: m.server.Handler()}
 	m.serving = true
@@ -334,9 +334,13 @@ func (m Model) View() string {
 	if m.serving {
 		serverDot = okStyle.Render("live " + m.addr)
 	}
+	authLabel := dimStyle.Render("open")
+	if m.server != nil && m.server.APIKey != "" {
+		authLabel = warnStyle.Render("locked")
+	}
 	b.WriteString(headerStyle.Render(
-		titleStyle.Render("multi-codex-proxy") + " " + serverDot +
-			dimStyle.Render("  " + truncate(m.status, max(10, cw-30)))) + "\n")
+		titleStyle.Render("multi-codex-proxy") + " " + serverDot + " " + authLabel +
+			dimStyle.Render("  " + truncate(m.status, max(10, cw-40)))) + "\n")
 
 	if m.lastErr != "" {
 		box := "ERR " + m.lastErr
