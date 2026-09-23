@@ -78,6 +78,9 @@ func main() {
 
 	model := tui.New(repo, srv, client, addr)
 	p := tea.NewProgram(model, tea.WithAltScreen())
+	srv.SetLog(func(f string, a ...any) {
+		p.Send(tui.ServerLog(f, a...))
+	})
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "tui: "+err.Error())
 		os.Exit(1)

@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"multi-codex-proxy/internal/accounts"
 	"multi-codex-proxy/internal/apperr"
@@ -22,37 +20,34 @@ type tickMsg struct{}
 type accountsMsg struct{ state codex.State }
 type errMsg struct{ err error }
 type logMsg struct{ line string }
+type srvLogMsg struct{ line string }
 
-var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	badStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	selStyle    = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15"))
-	barFill     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	headerStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	errBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("9")).Padding(0, 1)
-)
+// ServerLog formats one proxy server line for the log view. main sends it
+// through the Bubble Tea program, so server output lands in the log store
+// instead of stdout while the fullscreen TUI runs.
+func ServerLog(format string, args ...any) tea.Msg {
+	return srvLogMsg{line: fmt.Sprintf(format, args...)}
+}
 
 // Model owns TUI state. No globals, deps passed in.
+// Rendering lives in view.go, quota display in usage.go.
 type Model struct {
-	repo      *accounts.Repository
-	server    *proxy.Server
-	http      *http.Client
-	addr      string
-	state     codex.State
-	cursor    int
-	top       int
-	logs      []string
-	serving   bool
-	srv       *http.Server
+	repo       *accounts.Repository
+	server     *proxy.Server
+	http       *http.Client
+	addr       string
+	state      codex.State
+	cursor     int
+	top        int
+	logs       []string
+	serving    bool
+	srv        *http.Server
 	confirmDel bool
-	status    string
-	lastErr   string
-	lastHint  string
-	width     int
-	height    int
+	status     string
+	lastErr    string
+	lastHint   string
+	width      int
+	height     int
 }
 
 func New(repo *accounts.Repository, server *proxy.Server, client *http.Client, addr string) Model {
@@ -127,33 +122,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = truncate(msg.line, 60)
 		m.pushLog("%s", msg.line)
 		return m, nil
+	case srvLogMsg:
+		// Quiet on purpose: request traffic must not wipe the error box
+		// or steal the status line. It only appends to the log store.
+		m.pushLog("%s", msg.line)
+		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
-}
-
-// clampViewport keeps cursor visible and top in range for any height.
-func (m *Model) clampViewport() {
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
-	if len(m.state.Accounts) > 0 && m.cursor >= len(m.state.Accounts) {
-		m.cursor = len(m.state.Accounts) - 1
-	}
-	rows := m.visibleRows()
-	if rows < 1 {
-		rows = 1
-	}
-	if m.cursor < m.top {
-		m.top = m.cursor
-	}
-	if m.cursor >= m.top+rows {
-		m.top = m.cursor - rows + 1
-	}
-	if m.top < 0 {
-		m.top = 0
-	}
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -295,280 +272,4 @@ func (m *Model) stopServer() {
 		_ = m.srv.Close()
 	}
 	m.serving = false
-}
-
-// layout helpers: portrait is narrow, landscape is wide.
-
-func (m Model) contentWidth() int {
-	w := m.width - 4
-	if w < 40 {
-		w = 40
-	}
-	return w
-}
-
-func (m Model) isPortrait() bool { return m.width < 80 }
-
-func (m Model) visibleRows() int {
-	reserved := 10
-	if m.lastErr != "" {
-		reserved += 3
-	}
-	if m.confirmDel {
-		reserved++
-	}
-	rows := m.height - reserved
-	if m.isPortrait() {
-		rows -= 2
-	}
-	if rows < 3 {
-		rows = 3
-	}
-	return rows
-}
-
-func (m Model) View() string {
-	var b strings.Builder
-	cw := m.contentWidth()
-	serverDot := badStyle.Render("stopped")
-	if m.serving {
-		serverDot = okStyle.Render("live " + m.addr)
-	}
-	authLabel := dimStyle.Render("open")
-	if m.server != nil && m.server.APIKey != "" {
-		authLabel = warnStyle.Render("locked")
-	}
-	b.WriteString(headerStyle.Render(
-		titleStyle.Render("multi-codex-proxy") + " " + serverDot + " " + authLabel +
-			dimStyle.Render("  " + truncate(m.status, max(10, cw-40)))) + "\n")
-
-	if m.lastErr != "" {
-		box := "ERR " + m.lastErr
-		if m.lastHint != "" {
-			box += "\nHint: " + m.lastHint
-		}
-		b.WriteString(errBoxStyle.Render(truncateLines(box, cw)) + "\n")
-	}
-
-	if len(m.state.Accounts) == 0 {
-		b.WriteString(dimStyle.Render("No accounts yet. Press a to sign in.") + "\n")
-	} else if m.width >= 110 {
-		b.WriteString(m.landscapeView(cw))
-	} else {
-		b.WriteString(m.stackedView(cw))
-	}
-
-	if m.confirmDel {
-		b.WriteString(warnStyle.Render("Delete selected account? y / n") + "\n")
-	}
-	b.WriteString(m.logsView(cw))
-	b.WriteString("\n" + dimStyle.Render(m.footerKeys()))
-	return b.String()
-}
-
-// stackedView fits portrait phones and normal terms: one column.
-func (m Model) stackedView(cw int) string {
-	var b strings.Builder
-	end := min(len(m.state.Accounts), m.top+m.visibleRows())
-	for i := m.top; i < end; i++ {
-		a := m.state.Accounts[i]
-		if m.isPortrait() {
-			line := fmt.Sprintf("%s %s", statusDot(a), truncate(a.Email, cw-4))
-			sub := fmt.Sprintf("  %s  %s", plainToken(a), usageLabel(a))
-			if i == m.cursor {
-				b.WriteString(selStyle.Render(truncate(line, cw)) + "\n")
-				b.WriteString(selStyle.Render(truncate(sub, cw)) + "\n")
-			} else {
-				b.WriteString(truncate(line, cw) + "\n")
-				b.WriteString(dimStyle.Render(truncate(sub, cw)) + "\n")
-			}
-		} else {
-			line := fmt.Sprintf("%s  %-28s  %s  %s",
-				statusDot(a), truncatePad(a.Email, 28), tokenLabel(a), usageLabel(a))
-			if i == m.cursor {
-				b.WriteString(selStyle.Render(truncate(line, cw)) + "\n")
-			} else {
-				b.WriteString(truncate(line, cw) + "\n")
-			}
-		}
-		if i == m.cursor && a.Usage != nil {
-			b.WriteString("  " + truncate(usageBar(a.Usage.Primary, "5h", 14), cw) + "\n")
-			b.WriteString("  " + truncate(usageBar(a.Usage.Secondary, "wk", 14), cw) + "\n")
-		}
-	}
-	if len(m.state.Accounts) > m.visibleRows() {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("-- %d/%d --", m.cursor+1, len(m.state.Accounts))) + "\n")
-	}
-	return b.String()
-}
-
-// landscapeView splits wide terms: list left, detail plus quota right.
-func (m Model) landscapeView(cw int) string {
-	leftW := cw * 3 / 5
-	rightW := cw - leftW - 3
-	var left strings.Builder
-	end := min(len(m.state.Accounts), m.top+m.visibleRows())
-	for i := m.top; i < end; i++ {
-		a := m.state.Accounts[i]
-		line := fmt.Sprintf("%s %-24s %s", statusDot(a), truncatePad(a.Email, 24), plainToken(a))
-		if i == m.cursor {
-			left.WriteString(selStyle.Render(truncate(line, leftW)) + "\n")
-		} else {
-			left.WriteString(truncate(line, leftW) + "\n")
-		}
-	}
-	var right strings.Builder
-	if len(m.state.Accounts) > 0 {
-		a := m.state.Accounts[m.cursor]
-		right.WriteString(titleStyle.Render(truncate(a.Name, rightW)) + "\n")
-		right.WriteString(dimStyle.Render(truncate(a.Email, rightW)) + "\n")
-		right.WriteString(tokenLabel(a) + "  " + usageLabel(a) + "\n")
-		right.WriteString(truncate(usageBar(a.Usage.Primary, "5h", 16), rightW) + "\n")
-		right.WriteString(truncate(usageBar(a.Usage.Secondary, "week", 16), rightW) + "\n")
-		if a.Usage != nil && a.Usage.Primary != nil && a.Usage.Primary.ResetsAt != nil {
-			right.WriteString(dimStyle.Render("resets "+time.Unix(*a.Usage.Primary.ResetsAt, 0).Format("01-02 15:04")) + "\n")
-		}
-	}
-	return lipgloss.JoinHorizontal(lipgloss.Top,
-		lipgloss.NewStyle().Width(leftW).Render(left.String()),
-		lipgloss.NewStyle().Width(rightW).Render(right.String()),
-	) + "\n"
-}
-
-func (m Model) logsView(cw int) string {
-	if len(m.logs) == 0 {
-		return ""
-	}
-	keep := 4
-	if m.height > 30 {
-		keep = 6
-	}
-	if m.isPortrait() {
-		keep = 3
-	}
-	start := max(0, len(m.logs)-keep)
-	var b strings.Builder
-	b.WriteString(dimStyle.Render("logs") + "\n")
-	for _, l := range m.logs[start:] {
-		b.WriteString(dimStyle.Render(truncate(l, cw)) + "\n")
-	}
-	return b.String()
-}
-
-func (m Model) footerKeys() string {
-	if m.isPortrait() {
-		return "a add  r ref  e on/off  d del  s go  q out"
-	}
-	return "a add   r refresh   R all   e enable   d delete   s serve   q quit"
-}
-
-func statusDot(a codex.Account) string {
-	if !a.Enabled {
-		return dimStyle.Render("○")
-	}
-	switch a.TokenStatus {
-	case codex.StatusAvailable:
-		if a.IsAvailable(codex.NowMillis()) {
-			return okStyle.Render("●")
-		}
-		return warnStyle.Render("●")
-	case codex.StatusInvalid, codex.StatusExpired:
-		return badStyle.Render("●")
-	default:
-		return warnStyle.Render("●")
-	}
-}
-
-func tokenLabel(a codex.Account) string {
-	switch a.TokenStatus {
-	case codex.StatusAvailable:
-		return okStyle.Render("ready")
-	case codex.StatusExpired:
-		return warnStyle.Render("expired")
-	case codex.StatusInvalid:
-		return badStyle.Render("invalid")
-	default:
-		return dimStyle.Render("unknown")
-	}
-}
-
-func plainToken(a codex.Account) string {
-	switch a.TokenStatus {
-	case codex.StatusAvailable:
-		return "ready"
-	case codex.StatusExpired:
-		return "expired"
-	case codex.StatusInvalid:
-		return "invalid"
-	default:
-		return "unknown"
-	}
-}
-
-func usageLabel(a codex.Account) string {
-	if a.Usage == nil || a.Usage.Primary == nil {
-		return dimStyle.Render("usage --")
-	}
-	rem := 100.0 - a.Usage.Primary.UsedPercent
-	if rem < 0 {
-		rem = 0
-	}
-	return fmt.Sprintf("%.0f%% left", rem)
-}
-
-func usageBar(w *codex.UsageWindow, name string, cells int) string {
-	if w == nil {
-		return dimStyle.Render(name + "  no data")
-	}
-	rem := 100.0 - w.UsedPercent
-	if rem < 0 {
-		rem = 0
-	}
-	filled := int(rem / 100 * float64(cells))
-	bar := strings.Repeat("#", filled) + strings.Repeat("-", cells-filled)
-	return fmt.Sprintf("%s [%s] %.0f%%", name, barFill.Render(bar), rem)
-}
-
-func truncate(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	if n <= 1 {
-		return string(r[:n])
-	}
-	return string(r[:n-1]) + "…"
-}
-
-func truncatePad(s string, n int) string {
-	t := truncate(s, n)
-	if len([]rune(t)) < n {
-		return t + strings.Repeat(" ", n-len([]rune(t)))
-	}
-	return t
-}
-
-func truncateLines(s string, width int) string {
-	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		lines[i] = truncate(l, width-4)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

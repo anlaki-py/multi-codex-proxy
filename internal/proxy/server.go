@@ -51,6 +51,16 @@ func NewServer(repo *accounts.Repository, client *http.Client, log func(string, 
 	return &Server{repo: repo, client: client, ua: codex.UserAgent(runtime.GOOS, runtime.GOARCH), baseURL: codex.CodexAPI, log: log}
 }
 
+// SetLog swaps the log sink. main uses it to route server logs into the
+// TUI once the Bubble Tea program exists, so server output never reaches
+// stdout while the fullscreen TUI owns the screen.
+func (s *Server) SetLog(log func(string, ...any)) {
+	if log == nil {
+		log = func(string, ...any) {}
+	}
+	s.log = log
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
