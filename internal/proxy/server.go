@@ -175,6 +175,10 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	// Codex only serves stream:true. Non-stream clients get a collected
 	// object below, so always ask upstream for SSE.
 	body["stream"] = true
+	// Codex rejects store:true or missing store with
+	// 400 "Store must be set to false". OpenAI SDKs default to
+	// store:true, so force false here like chatToResponses does.
+	body["store"] = false
 
 	resp, acct, err := s.postUpstream(r.Context(), body, true)
 	if err != nil {
@@ -229,6 +233,9 @@ func (s *Server) postUpstream(ctx context.Context, body map[string]any, stream b
 	if err != nil {
 		return nil, codex.Account{}, err
 	}
+	// Safety net: every upstream call needs store:false. Responses handler
+	// and chatToResponses set it, but force it here so no path slips through.
+	body["store"] = false
 	for attempt := 0; attempt < 4; attempt++ {
 		resp, err := s.postOnce(ctx, body, stream, acct)
 		if err != nil {
