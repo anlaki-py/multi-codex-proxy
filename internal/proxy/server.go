@@ -88,8 +88,14 @@ func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// extraModels lists ids the upstream catalog does not advertise but the
+// responses endpoint still accepts. Temporary: delete an entry once
+// upstream lists it itself.
+var extraModels = []string{"gpt-6-luna"}
+
 // models mirrors CodexProvider.listModels: proxy the upstream list,
-// keep only visibility == list, return OpenAI list shape.
+// keep only visibility == list, return OpenAI list shape. Ids in
+// extraModels are appended when upstream omits them.
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeErr(w, 405, "method must be GET", "use GET /v1/models with no body")
@@ -129,6 +135,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	items, _ := parsed["models"].([]any)
 	data := []any{}
+	seen := map[string]bool{}
 	for _, it := range items {
 		m, _ := it.(map[string]any)
 		if m == nil {
@@ -141,8 +148,18 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 		if slug == "" {
 			continue
 		}
+		seen[slug] = true
 		data = append(data, map[string]any{
 			"id": slug, "object": "model", "owned_by": "codex",
+		})
+	}
+	// Skip ids upstream already listed so an entry never appears twice.
+	for _, id := range extraModels {
+		if seen[id] {
+			continue
+		}
+		data = append(data, map[string]any{
+			"id": id, "object": "model", "owned_by": "codex",
 		})
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
